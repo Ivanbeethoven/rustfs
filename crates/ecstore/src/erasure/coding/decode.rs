@@ -1085,7 +1085,6 @@ where
         let data_shards = self.data_shards;
         let read_timeout = self.read_timeout;
         let metrics_path = self.metrics_path;
-        let read_costs = self.read_costs.clone();
         let locality_preference_enabled = self.locality_preference_enabled;
         let stripe_read_start = metrics_path.map(|_| Instant::now());
 
@@ -1100,12 +1099,12 @@ where
         // before the retirement pass mutates `self.readers` below.
         {
             let mut sets = FuturesUnordered::new();
-            let reader_iter = ReaderLaunchIter::new(&mut self.readers, &read_costs, locality_preference_enabled);
+            let reader_iter = ReaderLaunchIter::new(&mut self.readers, self.read_costs.as_slice(), locality_preference_enabled);
             for (i, reader) in reader_iter {
                 if reader.is_none() || !participating[i] {
                     continue;
                 }
-                let read_cost = read_costs.get(i).copied().unwrap_or(ShardReadCost::Unknown);
+                let read_cost = self.read_costs.get(i).copied().unwrap_or(ShardReadCost::Unknown);
                 let recycled_buf = bufs[i].take();
                 scheduled += 1;
                 sets.push(read_shard(
@@ -1237,7 +1236,7 @@ where
             if !self.try_engage_parity(idx, stripe_index) {
                 continue;
             }
-            let read_cost = read_costs.get(idx).copied().unwrap_or(ShardReadCost::Unknown);
+            let read_cost = self.read_costs.get(idx).copied().unwrap_or(ShardReadCost::Unknown);
             let recycled_buf = Some(self.buffers.take(idx, shard_size));
             scheduled += 1;
             let (i, _read_cost, result, _should_retire) = read_shard(
