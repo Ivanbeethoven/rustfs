@@ -1306,8 +1306,9 @@ impl S3 for FakeBackend {
             ));
         }
 
-        let assign_own = lock(&self.store).assign_own_version_ids;
-        let version_id = new_version_id(&headers, assign_own)?;
+        // `state` is the live store guard: read the flag from it. Re-locking
+        // would self-deadlock (the store mutex is not reentrant).
+        let version_id = new_version_id(&headers, state.assign_own_version_ids)?;
         upsert_version(
             &mut state,
             &input.bucket,
@@ -1347,12 +1348,15 @@ impl S3 for FakeBackend {
         ensure_upload_budget(&state)?;
         validate_stored_metadata(&input.content_type, &input.metadata)?;
         let upload_id = Uuid::new_v4().to_string();
+        // Read the flag before the mutable borrow of `state.uploads` below
+        // (and never re-lock the store: the mutex is not reentrant).
+        let version_id = new_version_id(&headers, state.assign_own_version_ids)?;
         state.uploads.insert(
             upload_id.clone(),
             MultipartState {
                 bucket: input.bucket.clone(),
                 key: input.key.clone(),
-                version_id: new_version_id(&headers, lock(&self.store).assign_own_version_ids)?,
+                version_id,
                 content_type: input.content_type,
                 metadata: input.metadata,
                 parts: BTreeMap::new(),
