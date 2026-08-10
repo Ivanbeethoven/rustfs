@@ -143,6 +143,7 @@ struct ControlState {
 #[derive(Default)]
 struct StoreState {
     assign_own_version_ids: bool,
+    assign_own_multipart_version_ids: bool,
     buckets: HashMap<String, BucketState>,
     uploads: HashMap<String, MultipartState>,
     total_bytes: usize,
@@ -390,6 +391,12 @@ impl FakeS3Target {
     /// version-fidelity tests.
     pub fn assign_own_version_ids(&self, enabled: bool) {
         lock(&self.backend.store).assign_own_version_ids = enabled;
+    }
+
+    /// Mint own version ids for the multipart path only — models a target
+    /// that adopts PutObject version ids but not CreateMultipartUpload ones.
+    pub fn assign_own_multipart_version_ids(&self, enabled: bool) {
+        lock(&self.backend.store).assign_own_multipart_version_ids = enabled;
     }
 
     /// Queue `times` copies of a fault for one operation.
@@ -1350,7 +1357,8 @@ impl S3 for FakeBackend {
         let upload_id = Uuid::new_v4().to_string();
         // Read the flag before the mutable borrow of `state.uploads` below
         // (and never re-lock the store: the mutex is not reentrant).
-        let version_id = new_version_id(&headers, state.assign_own_version_ids)?;
+        let mint_own = state.assign_own_version_ids || state.assign_own_multipart_version_ids;
+        let version_id = new_version_id(&headers, mint_own)?;
         state.uploads.insert(
             upload_id.clone(),
             MultipartState {
