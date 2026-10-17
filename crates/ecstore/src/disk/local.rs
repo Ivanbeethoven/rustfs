@@ -1052,6 +1052,10 @@ const ENV_RUSTFS_OBJECT_MMAP_READ_METHOD: &str = "RUSTFS_OBJECT_MMAP_READ_METHOD
 const RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY: &str = "mmap_copy";
 #[cfg(any(unix, test))]
 const RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY: &str = "direct_read_copy";
+// Bound automatic positioned reads to short partial-file windows. Whole-file
+// reads retain mmap's measured large-transfer behavior.
+#[cfg(any(unix, test))]
+const MAX_AUTO_PARTIAL_READ_COPY_LENGTH: usize = 256 * 1024;
 
 /// Legacy binary switch for commit-point durability (fsync writes and renames).
 /// Kept for compatibility: `true` maps to the `strict` durability mode (the
@@ -1592,13 +1596,32 @@ fn should_populate_mmap_read(length: usize) -> bool {
 
 cached_read_env! {
     #[cfg(any(unix, test))]
-    fn local_read_copy_method() -> LocalReadCopyMethod = {
-        let method = rustfs_utils::get_env_str(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY);
-        match method.as_str() {
-            RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY => LocalReadCopyMethod::DirectReadCopy,
-            _ => LocalReadCopyMethod::MmapCopy,
+    fn local_read_copy_method() -> Option<LocalReadCopyMethod> = {
+        match std::env::var(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD) {
+            Err(std::env::VarError::NotPresent) => None,
+            Ok(method) if method == RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY => Some(LocalReadCopyMethod::DirectReadCopy),
+            Ok(method) if method == RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY => Some(LocalReadCopyMethod::MmapCopy),
+            // Empty/unknown values and non-Unicode values retain
+            // the existing mmap fallback instead of enabling automatic selection.
+            _ => Some(LocalReadCopyMethod::MmapCopy),
         }
     };
+}
+
+#[cfg(any(unix, test))]
+fn select_local_read_copy_method(configured: Option<LocalReadCopyMethod>, length: usize, file_len: u64) -> LocalReadCopyMethod {
+    if let Some(method) = configured {
+        return method;
+    }
+    if cfg!(target_os = "linux")
+        && length > 0
+        && length <= MAX_AUTO_PARTIAL_READ_COPY_LENGTH
+        && u64::try_from(length).is_ok_and(|length| length < file_len)
+    {
+        LocalReadCopyMethod::DirectReadCopy
+    } else {
+        LocalReadCopyMethod::MmapCopy
+    }
 }
 
 /// Runtime state for the true O_DIRECT read path (Linux only).
@@ -3288,6 +3311,7 @@ impl LocalIoBackend for StdBackend {
                 direct_read_copy_fault_delta: MmapPageFaultDelta,
                 blocking_task_duration: StdDuration,
                 used_direct_io: bool,
+                read_copy_method: LocalReadCopyMethod,
                 /// The descriptor and size snapshot opened by THIS call (None on a
                 /// cache hit), handed back so the async caller can index it in the
                 /// fd cache.
@@ -3312,7 +3336,7 @@ impl LocalIoBackend for StdBackend {
 
             let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
             let should_populate_mmap_read = should_populate_mmap_read(length);
-            let read_copy_method = local_read_copy_method();
+            let configured_read_copy_method = local_read_copy_method();
             #[cfg(target_os = "linux")]
             let direct_io_eligible = is_direct_io_read_enabled() && length > 0 && length >= get_direct_io_read_threshold();
             #[cfg(target_os = "linux")]
@@ -3406,6 +3430,7 @@ impl LocalIoBackend for StdBackend {
                 }
                 let metadata_validate_duration =
                     metadata_validate_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+                let read_copy_method = select_local_read_copy_method(configured_read_copy_method, length, metadata_len);
 
                 #[cfg(target_os = "macos")]
                 if should_reclaim_after_read {
@@ -3572,6 +3597,7 @@ impl LocalIoBackend for StdBackend {
                     direct_read_copy_fault_delta,
                     blocking_task_duration,
                     used_direct_io,
+                    read_copy_method,
                     opened_fd,
                 })
             })
@@ -3601,6 +3627,7 @@ impl LocalIoBackend for StdBackend {
                     return Err(DiskError::FileCorrupt);
                 }
             };
+            let read_copy_method = read_result.read_copy_method;
             if metrics_enabled && let Some(metrics) = metrics {
                 rustfs_io_metrics::record_get_object_stage_duration(
                     metrics.path,
@@ -21762,20 +21789,208 @@ mod test {
     #[test]
     fn local_read_copy_method_respects_env() {
         temp_env::with_var_unset(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, || {
-            assert_eq!(local_read_copy_method(), LocalReadCopyMethod::MmapCopy);
+            assert_eq!(local_read_copy_method(), None);
         });
 
         temp_env::with_var(
             ENV_RUSTFS_OBJECT_MMAP_READ_METHOD,
             Some(RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY),
             || {
-                assert_eq!(local_read_copy_method(), LocalReadCopyMethod::DirectReadCopy);
+                assert_eq!(local_read_copy_method(), Some(LocalReadCopyMethod::DirectReadCopy));
             },
         );
 
         temp_env::with_var(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, Some("unknown"), || {
-            assert_eq!(local_read_copy_method(), LocalReadCopyMethod::MmapCopy);
+            assert_eq!(local_read_copy_method(), Some(LocalReadCopyMethod::MmapCopy));
         });
+    }
+
+    #[test]
+    fn bounded_partial_read_policy_preserves_whole_files_and_explicit_methods() {
+        for value in [RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY, "", "unknown"] {
+            temp_env::with_var(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, Some(value), || {
+                assert_eq!(local_read_copy_method(), Some(LocalReadCopyMethod::MmapCopy));
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            temp_env::with_var(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, Some(std::ffi::OsString::from_vec(vec![0xff])), || {
+                assert_eq!(local_read_copy_method(), Some(LocalReadCopyMethod::MmapCopy));
+            });
+        }
+        for (length, file_len) in [
+            (0, 1),
+            (32, 32),
+            (262_144, 262_144),
+            (262_145, 1_048_576),
+            (usize::MAX, u64::MAX),
+        ] {
+            assert_eq!(select_local_read_copy_method(None, length, file_len), LocalReadCopyMethod::MmapCopy);
+        }
+        for (length, file_len) in [(1, 2), (16_416, 8_404_992), (131_136, 8_392_704), (262_144, 262_145)] {
+            let expected = if cfg!(target_os = "linux") {
+                LocalReadCopyMethod::DirectReadCopy
+            } else {
+                LocalReadCopyMethod::MmapCopy
+            };
+            assert_eq!(select_local_read_copy_method(None, length, file_len), expected);
+            assert_eq!(
+                select_local_read_copy_method(Some(LocalReadCopyMethod::MmapCopy), length, file_len),
+                LocalReadCopyMethod::MmapCopy
+            );
+        }
+        assert_eq!(
+            select_local_read_copy_method(Some(LocalReadCopyMethod::DirectReadCopy), 1_048_576, 1_048_576),
+            LocalReadCopyMethod::DirectReadCopy
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::serial]
+    fn bounded_partial_reads_preserve_bytes_metrics_and_shared_offsets() {
+        use std::io::{Seek, SeekFrom};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create runtime");
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        let previous_stage_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        let previous_metrics_gate = rustfs_io_metrics::metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        rustfs_io_metrics::set_metrics_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(temp_env::async_with_vars(
+                [
+                    (ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, None),
+                    (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, Some("false")),
+                    (rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, Some("true")),
+                    (rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, Some("1")),
+                ],
+                async {
+                    let dir = tempfile::tempdir().expect("create fixture root");
+                    std::fs::create_dir(dir.path().join("bucket")).expect("create volume");
+                    let content: Vec<u8> = (0..600_000).map(|i| u8::try_from(i % 251).expect("bounded byte")).collect();
+                    let path = dir.path().join("bucket/part");
+                    std::fs::write(&path, &content).expect("write fixture");
+                    std::fs::write(dir.path().join("bucket/small"), &content[..65_536]).expect("write small fixture");
+                    let mut backend = StdBackend::new_without_fd_cache(dir.path().to_path_buf());
+                    // This fixture opens only two files. Exercise real cache hits
+                    // even when the host's limit disables production cache admission.
+                    backend.fd_cache = Some(FdCache::new());
+                    let stage_metrics = MmapCopyStageMetrics {
+                        path: "bounded_partial_test",
+                        access_check_stage: "access",
+                        path_resolve_stage: "path",
+                        metadata_lookup_stage: "metadata_lookup",
+                        metadata_validate_stage: "metadata_validate",
+                        blocking_wait_stage: "blocking_wait",
+                        blocking_task_stage: "blocking_task",
+                        file_open_stage: "file_open",
+                        mmap_map_stage: "map",
+                        mmap_copy_stage: "copy",
+                        direct_read_copy_stage: "pread",
+                    };
+                    for (offset, length) in [
+                        (0, 16_416),
+                        (4095, 131_136),
+                        (100, 262_144),
+                        (0, 262_145),
+                        (0, content.len()),
+                        (content.len() - 31, 31),
+                    ] {
+                        let got = backend
+                            .pread_bytes("bucket", "part", offset, length, Some(stage_metrics))
+                            .await
+                            .expect("read range");
+                        assert_eq!(got.as_ref(), &content[offset..offset + length], "range {offset}/{length}");
+                    }
+                    assert_eq!(
+                        backend
+                            .pread_bytes("bucket", "small", 0, 65_536, Some(stage_metrics))
+                            .await
+                            .expect("whole small file")
+                            .as_ref(),
+                        &content[..65_536]
+                    );
+                    let key = FdKey {
+                        volume: "bucket".to_owned(),
+                        path: "part".to_owned(),
+                        direct: false,
+                    };
+                    let cached = backend
+                        .fd_cache
+                        .as_ref()
+                        .expect("cache")
+                        .get(&key)
+                        .await
+                        .expect("seeded descriptor");
+                    let mut shared_file = cached.file.as_ref();
+                    shared_file.seek(SeekFrom::Start(123)).expect("set shared cursor sentinel");
+                    let reads = (0..32).map(|i| {
+                        let backend = &backend;
+                        async move {
+                            let offset = i * 4093;
+                            (
+                                offset,
+                                backend
+                                    .pread_bytes("bucket", "part", offset, 65_568, None)
+                                    .await
+                                    .expect("concurrent range"),
+                            )
+                        }
+                    });
+                    for (offset, got) in futures::future::join_all(reads).await {
+                        assert_eq!(got.as_ref(), &content[offset..offset + 65_568]);
+                    }
+                    assert_eq!(
+                        shared_file.stream_position().expect("shared cursor"),
+                        123,
+                        "positioned reads must not seek"
+                    );
+                    assert!(matches!(
+                        backend.pread_bytes("bucket", "part", content.len() - 1, 2, None).await,
+                        Err(DiskError::FileCorrupt)
+                    ));
+                    assert!(matches!(
+                        backend.pread_bytes("bucket", "part", usize::MAX, 1, None).await,
+                        Err(DiskError::FileCorrupt)
+                    ));
+                    // Simulate an out-of-band truncation after the cached size snapshot.
+                    // The positioned read must surface its short read, not return zero padding.
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .expect("open for truncation")
+                        .set_len(8)
+                        .expect("truncate");
+                    let error = backend
+                        .pread_bytes("bucket", "part", 1, 32, None)
+                        .await
+                        .expect_err("short read must fail");
+                    assert!(
+                        matches!(error, DiskError::Io(ref inner) if inner.kind() == std::io::ErrorKind::UnexpectedEof),
+                        "{error:?}"
+                    );
+                },
+            ));
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_stage_gate);
+        rustfs_io_metrics::set_metrics_enabled(previous_metrics_gate);
+        for (stage, expected) in [("pread", 4), ("map", 3), ("copy", 3)] {
+            assert_eq!(
+                recorder
+                    .histogram_values(
+                        "rustfs_io_get_object_stage_duration_seconds",
+                        &[("path", "bounded_partial_test"), ("stage", stage)]
+                    )
+                    .len(),
+                expected,
+                "metrics must describe the selected backend: {stage}"
+            );
+        }
     }
 
     #[test]

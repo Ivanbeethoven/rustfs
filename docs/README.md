@@ -16,6 +16,9 @@ collection:
 For the logical per-operation io_uring read cap, see
 [io_uring read chunk size](operations/io-uring-read-chunks.md).
 
+For automatic short-window selection and explicit buffered read overrides, see
+[Local buffered read methods](operations/local-read-methods.md).
+
 For bounded local read-backend startup and cancellation, see
 [io_uring backend initialization](operations/io-uring-initialization.md).
 
