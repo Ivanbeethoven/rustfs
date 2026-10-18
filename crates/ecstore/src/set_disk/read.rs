@@ -39,7 +39,9 @@ use crate::diagnostics::get::{
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
 use crate::disk::{DiskAPI, new_disk};
-use crate::io_support::bitrot::{BitrotReaderStageMetrics, DeferredReaderStripeHandle, object_mmap_read_enabled};
+use crate::io_support::bitrot::{
+    BitrotReaderStageMetrics, DeferredReaderStripeHandle, object_mmap_read_enabled, read_frame_size_for_file_info,
+};
 use crate::set_disk::coding;
 use crate::set_disk::runtime_sources;
 use crate::set_disk::shard_source::{ShardReadCost, ShardReadRepair};
@@ -1086,7 +1088,7 @@ impl SetDisks {
         );
 
         let erasure = erasure_cache.get_for_file_info(&fi)?;
-        let frame_size = read_frame_size_for_file_info(&fi, &erasure)?;
+        let frame_size = read_frame_size_for_file_info(&fi, erasure.shard_size())?;
 
         let part_indices: Vec<usize> = (part_index..=last_part_index).collect();
         debug!(bucket, object, ?part_indices, "Multipart part indices to stream");
@@ -2116,7 +2118,7 @@ impl SetDisks {
         if part_length > part_size {
             return Err(Error::other("codec streaming reader part length exceeds part size"));
         }
-        let frame_size = read_frame_size_for_file_info(fi, erasure)?;
+        let frame_size = read_frame_size_for_file_info(fi, erasure.shard_size())?;
         let checksum_info = fi.erasure.get_checksum_info(part_number);
         let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
             HashAlgorithm::HighwayHash256SLegacy
@@ -2420,25 +2422,6 @@ fn multipart_part_checksum_algo(fi: &FileInfo, part_number: usize) -> HashAlgori
     } else {
         checksum_info.algorithm
     }
-}
-
-/// Resolve the physical authenticated frame size for a persisted object while
-/// keeping the original EC layout geometry for offsets and reconstruction.
-fn read_frame_size_for_file_info(fi: &FileInfo, erasure: &coding::Erasure) -> Result<usize> {
-    let Some(quantum) =
-        crate::object_api::persisted_ec_read_quantum(&fi.metadata, erasure.block_size, erasure.data_shards, erasure.shard_size())
-            .map_err(|error| Error::other(error.to_string()))?
-    else {
-        return Ok(erasure.shard_size());
-    };
-
-    if erasure.uses_legacy_codec() {
-        return Err(Error::other("EC read quantum marker is unsupported for legacy erasure objects"));
-    }
-    if fi.parts.iter().any(|part| part.integrity.is_some()) {
-        return Err(Error::other("EC read quantum marker cannot be combined with protected shard integrity"));
-    }
-    Ok(quantum)
 }
 
 fn quantized_range_quantum_label(frame_size: usize) -> &'static str {

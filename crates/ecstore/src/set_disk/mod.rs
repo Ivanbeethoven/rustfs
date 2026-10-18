@@ -6512,17 +6512,19 @@ async fn verify_inline_part_bitrot(meta: &FileInfo) -> disk::error::Result<()> {
     let shard_size = inline_erasure_shard_size(meta.erasure.block_size, meta.erasure.data_blocks, meta.uses_legacy_checksum);
     let part_size =
         inline_erasure_shard_file_size(part.size, meta.erasure.block_size, meta.erasure.data_blocks, meta.uses_legacy_checksum);
+    // Small external shards may also be loaded into FileInfo.data during healing.
+    let frame_size = crate::io_support::bitrot::read_frame_size_for_file_info(meta, shard_size).map_err(DiskError::from)?;
     // Check framing arithmetic and the physical buffer length before the shared
     // verifier sizes its scratch buffer from the metadata.
     let encoded_size = part_size
-        .div_ceil(shard_size)
+        .div_ceil(frame_size)
         .checked_mul(algo.size())
         .and_then(|hash_size| part_size.checked_add(hash_size))
         .ok_or(DiskError::FileCorrupt)?;
     if encoded_size != data.len() {
         return Err(DiskError::FileCorrupt);
     }
-    coding::bitrot_verify(Cursor::new(data), encoded_size, part_size, algo, shard_size)
+    coding::bitrot_verify(Cursor::new(data), encoded_size, part_size, algo, frame_size)
         .await
         .map_err(|_| DiskError::FileCorrupt)
 }

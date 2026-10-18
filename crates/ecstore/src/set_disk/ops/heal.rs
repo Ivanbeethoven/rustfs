@@ -16,11 +16,11 @@ use super::super::{
     Bytes, CHECK_PART_FILE_CORRUPT, CHECK_PART_SUCCESS, DeleteOptions, DiskError, DiskStore, DriveState, EVENT_SET_DISK_HEAL,
     Error, FileInfo, HashAlgorithm, HashMap, HealDriveInfo, HealItemType, HealOpts, HealResultItem, HealScanMode, Infos,
     LOG_SUBSYSTEM_SET_DISK, ObjectInfo, ObjectOptions, ObjectPartInfo, Path, RUSTFS_META_TMP_BUCKET, ReadOptions, Result,
-    SLASH_SEPARATOR, SetDisks, StorageError, Uuid, coding, count_errs, count_part_not_success, create_bitrot_reader,
-    create_bitrot_writer, debug, disk, disks_with_all_parts, encode_dir_object, error, file_info_is_valid_for_metadata,
-    formats_match_reference_slots, get_format_erasure_in_quorum, get_lock_acquire_timeout, has_suffix,
-    heal_bucket_local_on_disks, is_object_dir_dangling, join_all, load_format_erasure_all, path_join_buf, save_format_file,
-    should_heal_object_on_disk, stat_all_dirs, to_object_err, warn,
+    SLASH_SEPARATOR, SetDisks, StorageError, Uuid, coding, count_errs, count_part_not_success, create_bitrot_writer, debug, disk,
+    disks_with_all_parts, encode_dir_object, error, file_info_is_valid_for_metadata, formats_match_reference_slots,
+    get_format_erasure_in_quorum, get_lock_acquire_timeout, has_suffix, heal_bucket_local_on_disks, is_object_dir_dangling,
+    join_all, load_format_erasure_all, path_join_buf, save_format_file, should_heal_object_on_disk, stat_all_dirs, to_object_err,
+    warn,
 };
 use crate::bucket::retirement::MarkerRetirementContext;
 use crate::diagnostics::object_lock::ObjectLockAttempt;
@@ -36,7 +36,9 @@ struct ExplicitVersionHeal<'a> {
 use crate::disk::DataDirDeleteStatus;
 use crate::disk::DiskAPI;
 use crate::disk::local::{DELETE_DATA_DIR_MARKER_PREFIX, metadata_less_part_file};
-use crate::io_support::bitrot::object_mmap_read_enabled;
+use crate::io_support::bitrot::{
+    create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics, object_mmap_read_enabled, read_frame_size_for_file_info,
+};
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
@@ -1090,6 +1092,13 @@ impl SetDisks {
                             coding::Erasure::default()
                         };
 
+                        let frame_size = if !latest_meta.deleted && !latest_meta.is_remote() {
+                            read_frame_size_for_file_info(&latest_meta, erasure.shard_size()).map_err(DiskError::from)?
+                        } else {
+                            // Delete markers and remote objects construct no shard reader or writer.
+                            0
+                        };
+
                         result.object_size =
                             ObjectInfo::from_file_info(&latest_meta, bucket, object, true).get_actual_size()? as usize;
                         result.resolved_version_id = Some(*latest_meta.version_id.unwrap_or_default().as_bytes());
@@ -1606,17 +1615,19 @@ impl SetDisks {
                                             checksum_info.algorithm
                                         };
 
-                                        match create_bitrot_reader(
-                                            metadata.data.as_deref(),
+                                        match create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics(
+                                            metadata.data.clone(),
                                             Some(disk),
                                             bucket,
                                             &path_join_buf(&[object, &src_data_dir, &format!("part.{}", part.number)]),
                                             0,
                                             till_offset,
                                             erasure.shard_size(),
+                                            frame_size,
                                             checksum_algo.clone(),
                                             false,
                                             use_mmap_read,
+                                            None,
                                         )
                                         .await
                                         {
@@ -1670,7 +1681,7 @@ impl SetDisks {
                                                     &format!("part.{}", part.number),
                                                 ]),
                                                 erasure.shard_file_size(part.size as i64),
-                                                erasure.shard_size(),
+                                                frame_size,
                                                 HashAlgorithm::HighwayHash256S,
                                             )
                                             .await
@@ -4838,6 +4849,336 @@ mod heal_result_report_tests {
         );
         for (path, before) in preserved {
             assert_eq!(tokio::fs::read(path).await.expect("read unchanged legacy fixture"), before);
+        }
+    }
+
+    async fn assert_quantized_heal(block_size: usize, quantum: usize) {
+        use crate::erasure::coding::BitrotWriter;
+        use crate::object_api::{
+            EC_BLOCK_SIZE_HINT_INTERNAL_KEY, ShardIntegrityWriteMode, WriteCompletion, insert_ec_read_quantum,
+            persisted_ec_read_quantum,
+        };
+        use crate::storage_api_contracts::range::HTTPRangeSpec;
+        use rustfs_utils::HashAlgorithm;
+
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "quantized-heal";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create quantized fixture bucket");
+        }
+        let payload: Vec<u8> = (0..block_size + 123)
+            .map(|i| u8::try_from(i % 251).expect("fixture byte"))
+            .collect();
+        let opts = ObjectOptions {
+            no_lock: true,
+            write_completion: WriteCompletion::TailDrained,
+            shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+            user_defined: [(EC_BLOCK_SIZE_HINT_INTERNAL_KEY.to_owned(), block_size.to_string())].into(),
+            ..Default::default()
+        };
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_EC_READ_QUANTUM_ENABLE, Some("true")),
+                (rustfs_config::ENV_EC_READ_QUANTUM_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                set.put_object(bucket, object, &mut PutObjReader::from_vec(payload.clone()), &opts)
+                    .await
+                    .expect("seed all quantized shards");
+            },
+        )
+        .await;
+
+        let mut paths = Vec::new();
+        let mut originals = Vec::new();
+        let mut files = Vec::new();
+        for (dir, disk) in dirs.iter().zip(&disks) {
+            let mut file = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("seed populated every disk");
+            assert!(file.data.is_none(), "exercise physical parts, including the short final stripe");
+            assert!(!file.uses_legacy_checksum);
+            assert!(file.parts.iter().all(|part| part.integrity.is_none()));
+            assert_eq!(
+                (file.erasure.data_blocks, file.erasure.parity_blocks, file.erasure.block_size),
+                (2, 2, block_size)
+            );
+            let current = persisted_ec_read_quantum(&file.metadata, block_size, 2, block_size / 2)
+                .expect("valid seed marker")
+                .expect("seed must be quantized");
+            let path = dir
+                .path()
+                .join(bucket)
+                .join(object)
+                .join(file.data_dir.expect("external data directory").to_string())
+                .join("part.1");
+            assert_eq!(
+                disk.verify_file(bucket, object, &file)
+                    .await
+                    .expect("verify seed frames")
+                    .results,
+                vec![crate::disk::CHECK_PART_SUCCESS]
+            );
+            let mut bytes = tokio::fs::read(&path).await.expect("snapshot seed shard");
+            if current != quantum {
+                // Reframe the same EC payload to exercise an already-supported older marker.
+                let raw: Vec<u8> = bytes
+                    .chunks(current + 32)
+                    .flat_map(|frame| frame[32..].iter().copied())
+                    .collect();
+                let mut writer = BitrotWriter::new(std::io::Cursor::new(Vec::new()), quantum, HashAlgorithm::HighwayHash256S);
+                for frame in raw.chunks(quantum) {
+                    writer.write(frame).await.expect("encode older physical frame size");
+                }
+                writer.shutdown().await.expect("flush older framing");
+                bytes = writer.into_inner().into_inner();
+                tokio::fs::write(&path, &bytes).await.expect("install older framing fixture");
+                insert_ec_read_quantum(&mut file.metadata, quantum);
+                disk.write_metadata("", bucket, object, file.clone())
+                    .await
+                    .expect("persist older marker");
+            }
+            paths.push(path);
+            originals.push(bytes);
+            files.push(file);
+        }
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_EC_READ_QUANTUM_ENABLE, Some("false")),
+                (rustfs_config::ENV_EC_READ_QUANTUM_FLEET_CONFIRMED, Some("false")),
+            ],
+            async {
+                for (disk, file) in disks.iter().zip(&files) {
+                    assert_eq!(
+                        disk.verify_file(bucket, object, file)
+                            .await
+                            .expect("verify persisted frames with write gates off")
+                            .results,
+                        vec![crate::disk::CHECK_PART_SUCCESS]
+                    );
+                }
+                if block_size == 64 * 1024 {
+                    for disk in &disks {
+                        let loaded = disk
+                            .read_version(
+                                "",
+                                bucket,
+                                object,
+                                "",
+                                &ReadOptions {
+                                    read_data: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .expect("prefetch small external shard for healing");
+                        assert!(!loaded.inline_data());
+                        assert!(loaded.data.is_some(), "small external shards must exercise in-memory deep verification");
+                        crate::set_disk::verify_inline_part_bitrot(&loaded)
+                            .await
+                            .expect("verify prefetched physical frames");
+                    }
+                }
+                // The observed failure lost the whole object directory on a minority disk.
+                tokio::fs::remove_dir_all(dirs[0].path().join(bucket).join(object))
+                    .await
+                    .expect("remove one replica");
+                let normal = HealOpts {
+                    no_lock: true,
+                    ..Default::default()
+                };
+                let (healed, error) = set
+                    .heal_object(bucket, object, "", &normal)
+                    .await
+                    .expect("normal heal of missing replica");
+                assert!(error.is_none(), "block={block_size}, quantum={quantum}, error={error:?}");
+                assert_eq!(healed.drives_healed(), Some(1));
+                for (index, disk) in disks.iter().enumerate() {
+                    let file = disk
+                        .read_version("", bucket, object, "", &ReadOptions::default())
+                        .await
+                        .expect("healed metadata");
+                    assert_eq!(file.data_dir, files[index].data_dir);
+                    assert_eq!(file.erasure, files[index].erasure);
+                    for prefix in ["x-rustfs-internal-", "x-minio-internal-"] {
+                        assert_eq!(file.metadata.get(&format!("{prefix}ec-read-quantum")), Some(&quantum.to_string()));
+                    }
+                    assert_eq!(
+                        tokio::fs::read(&paths[index]).await.expect("read repaired physical shard"),
+                        originals[index]
+                    );
+                }
+                let parity_slot = files.iter().position(|file| file.erasure.index == 3).expect("parity shard");
+                let mut damaged = originals[parity_slot].clone();
+                damaged[32] ^= 1;
+                tokio::fs::write(&paths[parity_slot], &damaged)
+                    .await
+                    .expect("corrupt parity payload");
+                let metadata_before: Vec<_> = dirs
+                    .iter()
+                    .map(|dir| std::fs::read(dir.path().join(bucket).join(object).join("xl.meta")).expect("snapshot metadata"))
+                    .collect();
+                let deep = HealOpts {
+                    scan_mode: HealScanMode::Deep,
+                    ..normal
+                };
+                let (dry, error) = set
+                    .heal_object(bucket, object, "", &HealOpts { dry_run: true, ..deep })
+                    .await
+                    .expect("deep dry run");
+                assert!(error.is_none());
+                assert_eq!(dry.drives_healed(), Some(0));
+                assert_eq!(dry.after.drives[parity_slot].state, DriveState::Corrupt.to_string());
+                for (index, dir) in dirs.iter().enumerate() {
+                    assert_eq!(
+                        std::fs::read(dir.path().join(bucket).join(object).join("xl.meta")).expect("dry-run metadata"),
+                        metadata_before[index]
+                    );
+                    assert_eq!(
+                        tokio::fs::read(&paths[index]).await.expect("dry-run physical shard"),
+                        if index == parity_slot { &damaged } else { &originals[index] }.as_slice()
+                    );
+                }
+                let (healed, error) = set.heal_object(bucket, object, "", &deep).await.expect("deep repair");
+                assert!(error.is_none(), "deep repair: {error:?}");
+                assert_eq!(healed.drives_healed(), Some(1));
+                for (index, path) in paths.iter().enumerate() {
+                    assert_eq!(tokio::fs::read(path).await.expect("repaired part"), originals[index]);
+                }
+                for range in [
+                    None,
+                    Some((quantum - 7, quantum + 19)),
+                    Some((payload.len() - 63, payload.len() - 1)),
+                ] {
+                    let spec = range.map(|(start, end)| HTTPRangeSpec {
+                        is_suffix_length: false,
+                        start: i64::try_from(start).expect("range start"),
+                        end: i64::try_from(end).expect("range end"),
+                    });
+                    let mut reader = set
+                        .get_object_reader(bucket, object, spec, Default::default(), &opts)
+                        .await
+                        .expect("GET after heal");
+                    let mut actual = Vec::new();
+                    tokio::io::copy(&mut reader, &mut actual).await.expect("read healed object");
+                    let expected = range.map_or(payload.as_slice(), |(start, end)| &payload[start..=end]);
+                    assert_eq!(actual, expected, "block={block_size}, quantum={quantum}, range={range:?}");
+                }
+                let (healthy, error) = set.heal_object(bucket, object, "", &deep).await.expect("converged deep scan");
+                assert!(error.is_none());
+                assert_eq!(healthy.drives_healed(), Some(0));
+                if block_size == 256 * 1024 && quantum == 64 * 1024 {
+                    for conflicting in [false, true] {
+                        let mut before = Vec::new();
+                        for (index, disk) in disks.iter().enumerate() {
+                            let mut bad = files[index].clone();
+                            insert_ec_read_quantum(&mut bad.metadata, if conflicting { quantum } else { 0 });
+                            if conflicting {
+                                bad.metadata
+                                    .insert("x-minio-internal-ec-read-quantum".to_owned(), "131072".to_owned());
+                            }
+                            disk.write_metadata("", bucket, object, bad.clone())
+                                .await
+                                .expect("install malformed markers");
+                            assert!(
+                                disk.verify_file(bucket, object, &bad).await.is_err(),
+                                "invalid marker cannot certify frames"
+                            );
+                            before.push(
+                                std::fs::read(dirs[index].path().join(bucket).join(object).join("xl.meta"))
+                                    .expect("snapshot malformed metadata"),
+                            );
+                        }
+                        set.heal_object(bucket, object, "", &normal)
+                            .await
+                            .expect_err("even a normal healthy scan must reject malformed framing");
+                        for (index, disk) in disks.iter().enumerate() {
+                            assert_eq!(
+                                tokio::fs::read(&paths[index])
+                                    .await
+                                    .expect("preserved shard on invalid metadata"),
+                                originals[index]
+                            );
+                            assert_eq!(
+                                std::fs::read(dirs[index].path().join(bucket).join(object).join("xl.meta"))
+                                    .expect("preserved malformed metadata"),
+                                before[index]
+                            );
+                            disk.write_metadata("", bucket, object, files[index].clone())
+                                .await
+                                .expect("restore valid fixture metadata");
+                        }
+                    }
+                }
+                // Keep metadata on every disk: insufficient data quorum must not delete the survivor.
+                for path in paths.iter().take(3) {
+                    tokio::fs::write(path, []).await.expect("truncate three shards below quorum");
+                }
+                let metadata_before: Vec<_> = dirs
+                    .iter()
+                    .map(|dir| {
+                        std::fs::read(dir.path().join(bucket).join(object).join("xl.meta"))
+                            .expect("snapshot under-quorum metadata")
+                    })
+                    .collect();
+                let (failed, error) = set
+                    .heal_object(bucket, object, "", &deep)
+                    .await
+                    .expect("report insufficient quorum");
+                assert_eq!(error, Some(DiskError::ErasureReadQuorum));
+                assert_eq!(failed.drives_healed(), Some(0));
+                for (index, path) in paths.iter().enumerate() {
+                    assert_eq!(
+                        tokio::fs::read(path).await.expect("preserve under-quorum shards"),
+                        if index < 3 { &[][..] } else { originals[index].as_slice() }
+                    );
+                    assert_eq!(
+                        std::fs::read(dirs[index].path().join(bucket).join(object).join("xl.meta")).expect("preserved metadata"),
+                        metadata_before[index]
+                    );
+                }
+                // Restore only one shard: the two remaining valid shards are exactly read quorum.
+                tokio::fs::write(&paths[1], &originals[1])
+                    .await
+                    .expect("restore exactly read quorum");
+                let (healed, error) = set
+                    .heal_object(bucket, object, "", &deep)
+                    .await
+                    .expect("repair at exact read quorum");
+                assert!(error.is_none(), "exact quorum block={block_size}, quantum={quantum}: {error:?}");
+                assert_eq!(healed.drives_healed(), Some(2));
+                for (index, path) in paths.iter().enumerate() {
+                    assert_eq!(tokio::fs::read(path).await.expect("exact quorum repaired shard"), originals[index]);
+                }
+                let mut reader = set
+                    .get_object_reader(bucket, object, None, Default::default(), &opts)
+                    .await
+                    .expect("GET after exact quorum repair");
+                let mut actual = Vec::new();
+                tokio::io::copy(&mut reader, &mut actual)
+                    .await
+                    .expect("read exact quorum repair body");
+                assert_eq!(actual, payload);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn quantized_heal_preserves_current_and_older_frames_with_write_gates_off() {
+        for (block_size, quantum) in [
+            (64 * 1024, 16 * 1024),
+            (64 * 1024, 32 * 1024),
+            (256 * 1024, 64 * 1024),
+            (256 * 1024, 128 * 1024),
+            (4 * 1024 * 1024, 1024 * 1024),
+            (4 * 1024 * 1024, 256 * 1024),
+        ] {
+            assert_quantized_heal(block_size, quantum).await;
         }
     }
 

@@ -31,6 +31,7 @@ use rustfs_config::{
     DEFAULT_OBJECT_MMAP_READ_ENABLE, DEFAULT_OBJECT_MMAP_READ_MAX_LENGTH, ENV_OBJECT_MMAP_READ_ENABLE,
     ENV_OBJECT_MMAP_READ_MAX_LENGTH, ENV_OBJECT_ZERO_COPY_ENABLE,
 };
+use rustfs_filemeta::FileInfo;
 use rustfs_rio::ChunkReaderBox;
 use rustfs_utils::HashAlgorithm;
 use std::future::Future;
@@ -45,6 +46,27 @@ use tracing::debug;
 #[cfg(all(test, feature = "hotpath"))]
 tokio::task_local! {
     static FORCE_MMAP_COPY_FAILURE_FOR_TEST: ();
+}
+
+/// Resolve the physical authenticated frame size for a persisted object while
+/// keeping the original EC layout geometry for offsets and reconstruction.
+pub(crate) fn read_frame_size_for_file_info(fi: &FileInfo, shard_size: usize) -> io::Result<usize> {
+    let Some(quantum) =
+        crate::object_api::persisted_ec_read_quantum(&fi.metadata, fi.erasure.block_size, fi.erasure.data_blocks, shard_size)
+            .map_err(|error| io::Error::other(error.to_string()))?
+    else {
+        return Ok(shard_size);
+    };
+
+    if fi.uses_legacy_checksum {
+        return Err(io::Error::other("EC read quantum marker is unsupported for legacy erasure objects"));
+    }
+    if fi.parts.iter().any(|part| part.integrity.is_some()) {
+        return Err(io::Error::other(
+            "EC read quantum marker cannot be combined with protected shard integrity",
+        ));
+    }
+    Ok(quantum)
 }
 
 /// A shard source for the bitrot reader.
@@ -940,6 +962,68 @@ mod tests {
     use super::*;
     use rustfs_rio::ChunkReader;
     use std::collections::VecDeque;
+
+    #[test]
+    fn persisted_frame_size_rejects_invalid_and_incompatible_markers() {
+        use crate::erasure::coding::Erasure;
+        use crate::object_api::insert_ec_read_quantum;
+        use rustfs_filemeta::ObjectPartInfo;
+        use rustfs_filemeta::shard_integrity::{IntegrityLayout, PartIntegrity};
+
+        let erasure = Erasure::new_with_options(2, 2, 256 * 1024, false);
+        let mut file = FileInfo::new("object", 2, 2);
+        file.erasure.block_size = 256 * 1024;
+        assert_eq!(
+            read_frame_size_for_file_info(&file, erasure.shard_size()).expect("unmarked full frame"),
+            erasure.shard_size()
+        );
+        for quantum in [64 * 1024, 128 * 1024] {
+            insert_ec_read_quantum(&mut file.metadata, quantum);
+            assert_eq!(
+                read_frame_size_for_file_info(&file, erasure.shard_size()).expect("current or older marker"),
+                quantum
+            );
+        }
+        for value in ["0", "1", "32768", "not-a-number"] {
+            for prefix in ["x-rustfs-internal-", "x-minio-internal-"] {
+                file.metadata.insert(format!("{prefix}ec-read-quantum"), value.to_owned());
+            }
+            assert!(read_frame_size_for_file_info(&file, erasure.shard_size()).is_err(), "reject {value}");
+        }
+        insert_ec_read_quantum(&mut file.metadata, 64 * 1024);
+        file.metadata
+            .insert("x-minio-internal-ec-read-quantum".to_owned(), "131072".to_owned());
+        assert!(read_frame_size_for_file_info(&file, erasure.shard_size()).is_err(), "conflicting aliases");
+        insert_ec_read_quantum(&mut file.metadata, 64 * 1024);
+        let legacy = Erasure::new_with_options(2, 2, 256 * 1024, true);
+        file.uses_legacy_checksum = true;
+        assert!(
+            read_frame_size_for_file_info(&file, legacy.shard_size()).is_err(),
+            "legacy codec must reject a quantum marker"
+        );
+        file.uses_legacy_checksum = false;
+        file.parts.push(ObjectPartInfo {
+            number: 1,
+            integrity: Some(
+                PartIntegrity::new(IntegrityLayout::new(2, 2, 256 * 1024, false).expect("layout"), 1).expect("integrity"),
+            ),
+            ..Default::default()
+        });
+        assert!(
+            read_frame_size_for_file_info(&file, erasure.shard_size()).is_err(),
+            "protected format cannot carry a quantum marker"
+        );
+        file.metadata.clear();
+        assert_eq!(
+            read_frame_size_for_file_info(&file, erasure.shard_size()).expect("unmarked protected geometry"),
+            erasure.shard_size()
+        );
+        file.uses_legacy_checksum = true;
+        assert_eq!(
+            read_frame_size_for_file_info(&file, legacy.shard_size()).expect("unmarked legacy geometry"),
+            legacy.shard_size()
+        );
+    }
 
     #[test]
     fn bitrot_create_file_size_grows_known_length_by_checksums() {
