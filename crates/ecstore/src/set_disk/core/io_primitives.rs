@@ -1349,6 +1349,7 @@ async fn try_create_bitrot_readers_via_batch_pread(
     frame_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
+    demand_data_shards: Option<usize>,
 ) -> Option<BitrotReaderSetup> {
     use crate::disk::local::batch_shard_pread;
     use std::io::Cursor;
@@ -1384,34 +1385,44 @@ async fn try_create_bitrot_readers_via_batch_pread(
         return None;
     }
 
-    let requests: Vec<_> = batch_items.iter().map(|(_, p, off, len)| (p.clone(), *off, *len)).collect();
-    let batch_results = batch_shard_pread(requests).await;
-
+    // Keep the healthy data quorum in one blocking batch. A failed data
+    // setup still probes every remaining parity slot and preserves its error.
+    let initial_count = demand_data_shards.map_or(batch_items.len(), |data_shards| {
+        batch_items.partition_point(|(idx, _, _, _)| *idx < data_shards)
+    });
+    let (initial, reserve) = batch_items.split_at(initial_count);
     let mut setup = BitrotReaderSetup::new(disks.len());
-    for (i, (idx, _, _, _)) in batch_items.iter().enumerate() {
-        setup.mark_scheduled(*idx);
-        match &batch_results[i] {
-            Ok(bytes) => {
-                let reader = BitrotReader::new(
-                    ShardReader::InMemory(Cursor::new(bytes.clone())),
-                    shard_size,
-                    checksum_algo.clone(),
-                    skip_verify_bitrot,
-                );
-                setup.apply_reader_result(*idx, Ok(Some(reader)));
+    for items in [initial, reserve] {
+        if items.is_empty() {
+            continue;
+        }
+        let requests = items.iter().map(|(_, p, off, len)| (p.clone(), *off, *len)).collect();
+        let batch_results = batch_shard_pread(requests).await;
+        for (i, (idx, _, _, _)) in items.iter().enumerate() {
+            setup.mark_scheduled(*idx);
+            match &batch_results[i] {
+                Ok(bytes) => {
+                    let reader = BitrotReader::new(
+                        ShardReader::InMemory(Cursor::new(bytes.clone())),
+                        shard_size,
+                        checksum_algo.clone(),
+                        skip_verify_bitrot,
+                    );
+                    setup.apply_reader_result(*idx, Ok(Some(reader)));
+                }
+                Err(e) => {
+                    setup.apply_reader_result(*idx, Err(e.clone()));
+                }
             }
-            Err(e) => {
-                setup.apply_reader_result(*idx, Err(e.clone()));
-            }
+        }
+        if demand_data_shards.is_some_and(|data_shards| setup.available_data_shards(data_shards) == data_shards) {
+            break;
         }
     }
 
     for (idx, disk_op) in disks.iter().enumerate() {
-        if setup.scheduled[idx] {
-            continue;
-        }
-        setup.mark_scheduled(idx);
         if disk_op.is_none() {
+            setup.mark_scheduled(idx);
             setup.apply_reader_result(idx, Ok(None));
         }
     }
@@ -1433,6 +1444,7 @@ async fn try_create_bitrot_readers_via_batch_pread(
     _frame_size: usize,
     _checksum_algo: HashAlgorithm,
     _skip_verify_bitrot: bool,
+    _demand_data_shards: Option<usize>,
 ) -> Option<BitrotReaderSetup> {
     None
 }
@@ -1705,6 +1717,10 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
             frame_size,
             checksum_algo.clone(),
             skip_verify_bitrot,
+            (matches!(mode, BitrotReaderSetupMode::ReadQuorum)
+                && strategy == BitrotReaderSetupStrategy::DataBlocksFirst
+                && crate::erasure::coding::decode::get_lockstep_data_shards_only_enabled())
+            .then_some(data_shards),
         )
         .await
     {
@@ -11558,6 +11574,359 @@ mod tests {
             ShardReadCost::Remote
         );
         assert!(local_endpoint_hosts_for_shard_costs().is_empty());
+    }
+
+    #[cfg(unix)]
+    async fn demand_batch_fixture() -> (Vec<TempDir>, Vec<Option<DiskStore>>, Vec<FileInfo>, Vec<u8>, Vec<Vec<u8>>) {
+        let bucket = "demand-batch";
+        let erasure = coding::Erasure::new(2, 2, 128);
+        let payload: Vec<u8> = (0..391)
+            .map(|i| u8::try_from(i % 251).expect("bounded fixture byte"))
+            .collect();
+        let mut writers: Vec<_> = (0..4)
+            .map(|_| coding::BitrotWriter::new(Cursor::new(Vec::new()), 64, HashAlgorithm::HighwayHash256S))
+            .collect();
+        for block in payload.chunks(128) {
+            for (writer, shard) in writers
+                .iter_mut()
+                .zip(erasure.encode_data(block).expect("fixture EC encoding"))
+            {
+                writer.write(&shard).await.expect("fixture bitrot frame");
+            }
+        }
+        let encoded: Vec<_> = writers.into_iter().map(|writer| writer.into_inner().into_inner()).collect();
+        let (dirs, disks) = call_counter_local_disks(bucket, 4).await;
+        let files = vec![
+            FileInfo {
+                data_dir: Some(Uuid::new_v4()),
+                ..Default::default()
+            };
+            4
+        ];
+        for (index, disk) in disks.iter().enumerate() {
+            let path = format!("object/{}/part.1", files[index].data_dir.expect("fixture data directory"));
+            disk.as_ref()
+                .expect("fixture local disk")
+                .write_all(bucket, &path, Bytes::copy_from_slice(&encoded[index]))
+                .await
+                .expect("fixture shard file");
+        }
+        (dirs, disks, files, payload, encoded)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn demand_batch_setup_preserves_real_quorum_and_errors() {
+        let (dirs, disks, files, payload, _) = demand_batch_fixture().await;
+        let erasure = coding::Erasure::new(2, 2, 128);
+        let length = usize::try_from(erasure.shard_file_size(i64::try_from(payload.len()).expect("fixture length")))
+            .expect("fixture shard length");
+        let setup = try_create_bitrot_readers_via_batch_pread(
+            &files,
+            &disks,
+            "demand-batch",
+            "object",
+            1,
+            0,
+            length,
+            64,
+            64,
+            HashAlgorithm::HighwayHash256S,
+            false,
+            Some(2),
+        )
+        .await
+        .expect("local ordinary batch");
+        assert_eq!(setup.attempted, [true, true, false, false]);
+        assert_eq!(setup.scheduled_shards(), 2);
+        assert_eq!(setup.available_shards(), 2);
+        assert_eq!(setup.pending_scheduled_shards(), 0);
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum));
+
+        let data_path = dirs[0]
+            .path()
+            .join("demand-batch/object")
+            .join(files[0].data_dir.expect("fixture directory").to_string())
+            .join("part.1");
+        tokio::fs::write(&data_path, [0])
+            .await
+            .expect("truncate data shard before setup");
+        let setup = try_create_bitrot_readers_via_batch_pread(
+            &files,
+            &disks,
+            "demand-batch",
+            "object",
+            1,
+            0,
+            length,
+            64,
+            64,
+            HashAlgorithm::HighwayHash256S,
+            false,
+            Some(2),
+        )
+        .await
+        .expect("degraded ordinary batch");
+        assert_eq!(setup.attempted, [true; 4], "data failure must probe both parity sources");
+        assert!(matches!(setup.errors[0], Some(DiskError::FileCorrupt)));
+        assert_eq!(setup.available_shards(), 3);
+        assert_eq!(setup.completed_failed_shards(), 1);
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::VerifyReconstruction));
+
+        for (missing, expected_ready) in [(vec![0], 3), (vec![0, 2], 2), (vec![0, 2, 3], 1)] {
+            let mut available = disks.clone();
+            for &index in &missing {
+                available[index] = None;
+            }
+            let setup = try_create_bitrot_readers_via_batch_pread(
+                &files,
+                &available,
+                "demand-batch",
+                "object",
+                1,
+                0,
+                length,
+                64,
+                64,
+                HashAlgorithm::HighwayHash256S,
+                false,
+                Some(2),
+            )
+            .await
+            .expect("remaining local disks");
+            assert_eq!(setup.available_shards(), expected_ready);
+            assert_eq!(setup.attempted_shards(), 4, "each slot is accounted exactly once");
+            assert_eq!(setup.completed_failed_shards(), missing.len());
+            for &index in &missing {
+                assert!(matches!(setup.errors[index], Some(DiskError::DiskNotFound)));
+            }
+            assert_eq!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum), expected_ready >= 2);
+            assert_eq!(
+                setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::VerifyReconstruction),
+                expected_ready >= 3
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn demand_batch_production_setup_respects_policy_controls() {
+        let (_dirs, disks, files, payload, _) = demand_batch_fixture().await;
+        let erasure = coding::Erasure::new(2, 2, 128);
+        let length = usize::try_from(erasure.shard_file_size(i64::try_from(payload.len()).expect("fixture length")))
+            .expect("fixture shard length");
+        for (enabled, first, mode, expected_ready) in [
+            ("false", "true", BitrotReaderSetupMode::ReadQuorum, 4),
+            ("true", "true", BitrotReaderSetupMode::ReadQuorum, 2),
+            ("true", "false", BitrotReaderSetupMode::ReadQuorum, 4),
+            ("true", "true", BitrotReaderSetupMode::VerifyReconstruction, 4),
+        ] {
+            temp_env::async_with_vars(
+                [
+                    ("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", Some(enabled)),
+                    (ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, Some(first)),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP, Some(first)),
+                ],
+                async {
+                    for (offset, requested) in [(0, payload.len()), (145, payload.len() - 145)] {
+                        let read_offset = (offset / 128) * 64;
+                        let read_length = erasure.shard_file_offset(offset, requested, payload.len()) - read_offset;
+                        let setup = create_bitrot_readers_until_quorum_with_preference_and_frame_size(
+                            &files,
+                            &disks,
+                            "demand-batch",
+                            "object",
+                            1,
+                            read_offset,
+                            read_length,
+                            64,
+                            64,
+                            HashAlgorithm::HighwayHash256S,
+                            false,
+                            true,
+                            2,
+                            2,
+                            mode,
+                            false,
+                            None,
+                            None,
+                        )
+                        .await;
+                        assert_eq!(setup.available_shards(), expected_ready, "{enabled}/{first}/{}", mode.as_str());
+                        assert_eq!(setup.attempted_shards(), expected_ready);
+                        if expected_ready == 2 {
+                            assert_eq!(setup.deferred_shards(), 2, "unread parity must remain available on demand");
+                            assert!(setup.deferred_stripe_handles[2..].iter().all(Option::is_some));
+                            assert!(setup.deferred_reopeners[2..].iter().all(Option::is_some));
+                        }
+                        let mut body = Vec::new();
+                        let (written, error) = erasure
+                            .decode_with_stripe_handles_and_reopeners(
+                                &mut body,
+                                setup.readers,
+                                offset,
+                                requested,
+                                payload.len(),
+                                None,
+                                setup.deferred_stripe_handles,
+                                setup.deferred_reopeners,
+                            )
+                            .await;
+                        assert!(error.is_none(), "healthy policy control: {error:?}");
+                        assert_eq!(written, requested);
+                        assert_eq!(body, payload[offset..offset + requested]);
+                    }
+                },
+            )
+            .await;
+        }
+        assert!(
+            try_create_bitrot_readers_via_batch_pread(
+                &files,
+                &disks,
+                "demand-batch",
+                "object",
+                1,
+                0,
+                length,
+                64,
+                16,
+                HashAlgorithm::HighwayHash256S,
+                false,
+                Some(2),
+            )
+            .await
+            .is_none(),
+            "quantized frames must keep their separate path"
+        );
+        let mut inline = files.clone();
+        inline[0].data = Some(Bytes::from_static(b"inline"));
+        assert!(
+            try_create_bitrot_readers_via_batch_pread(
+                &inline,
+                &disks,
+                "demand-batch",
+                "object",
+                1,
+                0,
+                length,
+                64,
+                64,
+                HashAlgorithm::HighwayHash256S,
+                false,
+                Some(2),
+            )
+            .await
+            .is_none(),
+            "inline metadata must keep its separate path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn demand_batch_late_corruption_uses_aligned_parity_and_fails_without_surplus() {
+        let (dirs, disks, files, payload, encoded) = demand_batch_fixture().await;
+        let erasure = coding::Erasure::new(2, 2, 128);
+        let length = usize::try_from(erasure.shard_file_size(i64::try_from(payload.len()).expect("fixture length")))
+            .expect("fixture shard length");
+        let paths: Vec<_> = dirs
+            .iter()
+            .zip(&files)
+            .map(|(dir, file)| {
+                dir.path()
+                    .join("demand-batch/object")
+                    .join(file.data_dir.expect("fixture directory").to_string())
+                    .join("part.1")
+            })
+            .collect();
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", Some("true")),
+                (ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, Some("true")),
+            ],
+            async {
+                for missing_surplus in [false, true] {
+                    for (path, bytes) in paths.iter().zip(&encoded) {
+                        tokio::fs::write(path, bytes).await.expect("reset encoded fixture");
+                    }
+                    let mut corrupt_data = encoded[0].clone();
+                    corrupt_data[96 + 32 + 7] ^= 1;
+                    tokio::fs::write(&paths[0], &corrupt_data)
+                        .await
+                        .expect("corrupt second data frame");
+                    for path in &paths[2..] {
+                        tokio::fs::rename(path, path.with_extension("reserve"))
+                            .await
+                            .expect("hide unread parity during setup");
+                    }
+                    let setup = create_bitrot_readers_until_quorum_with_preference_and_frame_size(
+                        &files,
+                        &disks,
+                        "demand-batch",
+                        "object",
+                        1,
+                        0,
+                        length,
+                        64,
+                        64,
+                        HashAlgorithm::HighwayHash256S,
+                        false,
+                        true,
+                        2,
+                        2,
+                        BitrotReaderSetupMode::ReadQuorum,
+                        false,
+                        None,
+                        None,
+                    )
+                    .await;
+                    assert_eq!(setup.attempted, [true, true, false, false]);
+                    assert_eq!(setup.available_shards(), 2);
+                    assert_eq!(setup.deferred_shards(), 2, "missing parity must not be opened eagerly");
+                    for path in &paths[2..] {
+                        tokio::fs::rename(path.with_extension("reserve"), path)
+                            .await
+                            .expect("restore parity before decode");
+                    }
+                    if missing_surplus {
+                        let mut corrupt_parity = encoded[2].clone();
+                        corrupt_parity[96 + 32 + 7] ^= 1;
+                        tokio::fs::write(&paths[2], &corrupt_parity)
+                            .await
+                            .expect("corrupt required verification source");
+                    }
+                    let mut body = Vec::new();
+                    let outcome = erasure
+                        .decode_with_stripe_handles_and_reopeners_with_diagnostics(
+                            &mut body,
+                            setup.readers,
+                            0,
+                            payload.len(),
+                            payload.len(),
+                            None,
+                            setup.deferred_stripe_handles,
+                            setup.deferred_reopeners,
+                        )
+                        .await;
+                    assert!(outcome.repair.needed(false), "observed data corruption must retain repair evidence");
+                    if missing_surplus {
+                        assert_eq!(
+                            outcome.error.expect("reconstruction needs a verification source").kind(),
+                            std::io::ErrorKind::InvalidData
+                        );
+                        assert_eq!(outcome.written, 128, "only the authenticated first stripe may be emitted");
+                        assert_eq!(body, payload[..128]);
+                    } else {
+                        assert!(outcome.error.is_none(), "aligned parity must recover later stripes: {:?}", outcome.error);
+                        assert_eq!(outcome.written, payload.len());
+                        assert_eq!(body, payload, "including the final partial stripe");
+                    }
+                }
+            },
+        )
+        .await;
     }
 
     #[test]
