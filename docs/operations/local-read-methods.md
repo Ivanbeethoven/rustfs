@@ -30,3 +30,11 @@ ranges while retaining the full-file method. It is not a memory quota or a
 universal performance guarantee. Compare complete PUT, full GET and Range
 workloads before deployment. Set `mmap_copy` to retain the prior buffered
 method for an operational comparison.
+
+Local batch reads also accept externally stored quantized shards. Their encoded
+window includes every persisted frame checksum and remains subject to
+`RUSTFS_OBJECT_MMAP_READ_MAX_LENGTH`; the decoder still uses the logical EC
+shard size and verifies each physical frame. Eligible ordinary and quantized
+windows share the existing buffered batch path, including its cache behavior.
+This does not change the writer's block hint or frame selector. Inline, remote,
+CopySource and over-cap reads retain their existing paths.

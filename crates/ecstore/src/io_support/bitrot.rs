@@ -573,7 +573,7 @@ fn bitrot_encoded_range(offset: usize, length: usize, shard_size: usize, checksu
     adjust_shard_read_params(offset, length, shard_size, &checksum_algo)
 }
 
-fn bitrot_encoded_range_with_frame_size(
+pub(crate) fn bitrot_encoded_range_with_frame_size(
     offset: usize,
     length: usize,
     shard_size: usize,
