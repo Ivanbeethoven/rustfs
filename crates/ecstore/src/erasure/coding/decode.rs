@@ -962,7 +962,7 @@ fn retire_abandoned_readers(errs: &mut [Option<Error>], retire_readers: &mut Sha
     }
 }
 
-fn shard_read_hedge_delay(read_timeout: Duration) -> Option<Duration> {
+pub(crate) fn shard_read_hedge_delay(read_timeout: Duration) -> Option<Duration> {
     if read_timeout.is_zero() {
         None
     } else {

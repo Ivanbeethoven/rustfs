@@ -2148,6 +2148,9 @@ impl SetDisks {
             quantum_label,
             u64::try_from(length).unwrap_or(u64::MAX),
         );
+        let present_sources = (0..disks.len())
+            .filter(|&idx| files.get(idx).is_some_and(|file| file.data.is_some()) || disks[idx].is_some())
+            .count();
         let mut total_read = 0usize;
         for current_part in part_index..=last_part_index {
             if total_read == length {
@@ -2156,6 +2159,13 @@ impl SetDisks {
 
             let part_number = fi.parts[current_part].number;
             let part_size = fi.parts[current_part].size;
+            let part_checksum_algo = multipart_part_checksum_algo(fi, part_number);
+            let part_allows_direct_shards = !erasure.uses_legacy_codec()
+                && !skip_verify_bitrot
+                && !require_reconstruction_surplus
+                && part_checksum_algo.size() > 0
+                && fi.parts[current_part].integrity.is_none()
+                && present_sources >= erasure.data_shards;
             let part_remaining = quantized_part_remaining(part_size, part_offset)?;
             let part_length = part_remaining.min(length - total_read);
             let mut segment_offset = part_offset;
@@ -2191,16 +2201,121 @@ impl SetDisks {
                     return Err(Error::other("EC read quantum shard offset exceeds encoded block"));
                 }
                 let shard_remaining = block_shard_size - within_shard;
-                let read_full_block = within_block == 0 && segment_remaining >= block_data_len;
+                let block_data_remaining = block_data_len - within_block;
+                let block_segment_length = segment_remaining.min(block_data_remaining);
+                if block_segment_length == 0 {
+                    return Err(Error::other("EC read quantum segment is empty"));
+                }
+                let last_shard = (within_block + block_segment_length - 1) / block_shard_size;
+                if last_shard >= erasure.data_shards {
+                    return Err(Error::other("EC read quantum end data shard index is out of range"));
+                }
+
+                // Healthy systematic fast path: open and authenticate ONLY the
+                // spanned data shards (`shard_index..=last_shard`) concurrently in
+                // a single parallel wave, reading only each shard's minimal
+                // frame-aligned window instead of fanning out to all `data_shards`
+                // or iterating shard-by-shard sequentially. If any target shard is
+                // missing, corrupt, or exceeds the hedge delay, zero bytes are
+                // emitted here and we fall through cleanly to full-quorum RS decode.
+                let mut direct_attempted = false;
+                let mut direct_observed_corruption = false;
+                let mut direct_timed_out = false;
+                if part_allows_direct_shards
+                    && (shard_index..=last_shard).all(|idx| {
+                        idx < disks.len() && (files.get(idx).is_some_and(|file| file.data.is_some()) || disks[idx].is_some())
+                    })
+                {
+                    direct_attempted = true;
+                    match try_read_quantized_spanned_shards_direct(
+                        files,
+                        disks,
+                        bucket,
+                        object,
+                        part_number,
+                        block_index,
+                        within_block,
+                        block_segment_length,
+                        block_shard_size,
+                        logical_shard_size,
+                        frame_size,
+                        shard_index,
+                        last_shard,
+                        &part_checksum_algo,
+                        use_mmap_read,
+                        metrics_path,
+                    )
+                    .await?
+                    {
+                        DirectSpannedQuantizedOutcome::Success(direct) => {
+                            rustfs_io_metrics::record_get_object_quantized_range_reader_setup(
+                                metrics_path,
+                                metrics_object_class,
+                                metrics_size_bucket,
+                                quantum_label,
+                            );
+                            rustfs_io_metrics::record_get_object_shard_reader_setup_duration(direct.setup_elapsed.as_secs_f64());
+                            rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                                metrics_path,
+                                GET_STAGE_READER_SETUP,
+                                metrics_object_class,
+                                metrics_size_bucket,
+                                direct.setup_elapsed.as_secs_f64(),
+                            );
+                            rustfs_io_metrics::record_get_object_quantized_range_quorum_window_bytes(
+                                metrics_path,
+                                metrics_object_class,
+                                metrics_size_bucket,
+                                quantum_label,
+                                direct.window_bytes,
+                            );
+                            rustfs_io_metrics::record_get_object_quantized_range_frames(
+                                metrics_path,
+                                metrics_object_class,
+                                metrics_size_bucket,
+                                quantum_label,
+                                u64::try_from(direct.frame_count).unwrap_or(u64::MAX),
+                            );
+                            rustfs_io_metrics::record_get_object_quantized_range_read_dispatches(
+                                metrics_path,
+                                metrics_object_class,
+                                metrics_size_bucket,
+                                quantum_label,
+                                u64::try_from(direct.read_dispatch_count).unwrap_or(u64::MAX),
+                            );
+                            for (buf, rel_offset, slice_len) in &direct.slices {
+                                if let Err(err) =
+                                    tokio::io::AsyncWriteExt::write_all(&mut *writer, &buf[*rel_offset..*rel_offset + *slice_len])
+                                        .await
+                                {
+                                    let disk_error: DiskError = err.into();
+                                    return Err(disk_error.into());
+                                }
+                            }
+                            total_read += block_segment_length;
+                            segment_offset += block_segment_length;
+                            segment_remaining -= block_segment_length;
+                            continue;
+                        }
+                        DirectSpannedQuantizedOutcome::Fallback {
+                            observed_corruption,
+                            timed_out,
+                        } => {
+                            direct_observed_corruption = observed_corruption;
+                            direct_timed_out = timed_out;
+                        }
+                    }
+                }
+
+                // Coalesce any multi-shard segment within the block into a single
+                // parallel block decode regardless of starting `shard_index` or
+                // `within_shard`, avoiding O(data_shards) serial reader setups.
+                let read_full_block = block_segment_length > shard_remaining;
                 let (segment_length, read_shard_size, read_offset, output_offset) = if read_full_block {
-                    // A complete logical block needs every data shard, but
-                    // each shard only once. Group its data-shard segments
-                    // into one decode so a 64 KiB request does not read the
-                    // same 32 KiB data shard twice.
                     let read_offset = block_index
                         .checked_mul(logical_shard_size)
                         .ok_or_else(|| Error::other("EC read quantum offset overflows"))?;
-                    (block_data_len, block_shard_size, read_offset, 0)
+                    (block_segment_length, block_shard_size, read_offset, within_block)
                 } else {
                     let segment_length = segment_remaining.min(block_remaining).min(shard_remaining);
                     if segment_length == 0 {
@@ -2234,7 +2349,7 @@ impl SetDisks {
                     read_offset,
                     read_length: read_shard_size,
                     frame_size,
-                    checksum_algo: multipart_part_checksum_algo(fi, part_number),
+                    checksum_algo: part_checksum_algo.clone(),
                 };
                 let (reader_setup, reader_setup_elapsed) = setup_multipart_part_readers(
                     files,
@@ -2305,6 +2420,10 @@ impl SetDisks {
                 let readers = reader_setup.readers;
                 let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
                 let deferred_reopeners = reader_setup.deferred_reopeners;
+                let allow_quorum_direct_shard = (!direct_attempted || direct_timed_out)
+                    && !skip_verify_bitrot
+                    && !require_reconstruction_surplus
+                    && part_checksum_algo.size() > 0;
                 let outcome = erasure
                     .clone()
                     .decode_quantized_range_with_stripe_handles_and_reopeners(
@@ -2316,9 +2435,7 @@ impl SetDisks {
                         read_costs,
                         deferred_stripe_handles,
                         deferred_reopeners,
-                        !skip_verify_bitrot
-                            && !require_reconstruction_surplus
-                            && multipart_part_checksum_algo(fi, part_number).size() > 0,
+                        allow_quorum_direct_shard,
                     )
                     .await;
                 rustfs_io_metrics::record_get_object_quantized_range_frames(
@@ -2335,7 +2452,7 @@ impl SetDisks {
                     quantum_label,
                     u64::try_from(outcome.read_dispatch_count).unwrap_or(u64::MAX),
                 );
-                let mut repair_needed = outcome.repair.needed(!unattempted_data_shards);
+                let mut repair_needed = direct_observed_corruption || outcome.repair.needed(!unattempted_data_shards);
                 if require_reconstruction_surplus && outcome.exact_quorum && outcome.error.is_none() {
                     return Err(Error::other("two-phase read completed with exact reconstruction quorum"));
                 }
@@ -3009,6 +3126,206 @@ fn quantized_part_remaining(part_size: usize, part_offset: usize) -> Result<usiz
     part_size
         .checked_sub(part_offset)
         .ok_or_else(|| Error::other("EC read quantum part offset exceeds part size"))
+}
+
+struct DirectSpannedQuantizedRead {
+    slices: Vec<(Vec<u8>, usize, usize)>,
+    setup_elapsed: Duration,
+    window_bytes: u64,
+    frame_count: usize,
+    read_dispatch_count: usize,
+}
+
+enum DirectSpannedQuantizedOutcome {
+    Success(DirectSpannedQuantizedRead),
+    Fallback { observed_corruption: bool, timed_out: bool },
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_read_quantized_spanned_shards_direct(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    block_index: usize,
+    within_block: usize,
+    block_segment_length: usize,
+    block_shard_size: usize,
+    logical_shard_size: usize,
+    frame_size: usize,
+    first_shard: usize,
+    last_shard: usize,
+    checksum_algo: &HashAlgorithm,
+    use_mmap_read: bool,
+    metrics_path: &'static str,
+) -> Result<DirectSpannedQuantizedOutcome> {
+    let range_end_in_block = within_block
+        .checked_add(block_segment_length)
+        .ok_or_else(|| Error::other("EC read quantum block segment overflows"))?;
+    let block_shard_offset = block_index
+        .checked_mul(logical_shard_size)
+        .ok_or_else(|| Error::other("EC read quantum offset overflows"))?;
+
+    let mut plans = Vec::with_capacity(last_shard - first_shard + 1);
+    let mut window_bytes = 0u64;
+    for shard_idx in first_shard..=last_shard {
+        let shard_start_in_block = shard_idx
+            .checked_mul(block_shard_size)
+            .ok_or_else(|| Error::other("EC read quantum shard start overflows"))?;
+        let slice_start = within_block.saturating_sub(shard_start_in_block);
+        let slice_end = range_end_in_block
+            .checked_sub(shard_start_in_block)
+            .ok_or_else(|| Error::other("EC read quantum shard end underflows"))?
+            .min(block_shard_size);
+        let slice_len = slice_end
+            .checked_sub(slice_start)
+            .filter(|len| *len > 0)
+            .ok_or_else(|| Error::other("EC read quantum spanned shard slice is empty"))?;
+        let q_base = (slice_start / frame_size) * frame_size;
+        let rel_offset = slice_start - q_base;
+        let covered = rel_offset
+            .checked_add(slice_len)
+            .ok_or_else(|| Error::other("EC read quantum segment overflows"))?;
+        let frame_count = covered.div_ceil(frame_size);
+        let frame_aligned_size = frame_count
+            .checked_mul(frame_size)
+            .ok_or_else(|| Error::other("EC read quantum frame size overflows"))?;
+        let q_len = frame_aligned_size.min(block_shard_size - q_base);
+        let shard_read_offset = block_shard_offset
+            .checked_add(q_base)
+            .ok_or_else(|| Error::other("EC read quantum offset overflows"))?;
+        window_bytes = window_bytes.saturating_add(u64::try_from(q_len).unwrap_or(u64::MAX));
+        plans.push((shard_idx, shard_read_offset, q_len, rel_offset, slice_len));
+    }
+
+    let stage_metrics = rustfs_io_metrics::get_stage_metrics_enabled().then_some(BitrotReaderStageMetrics {
+        path: metrics_path,
+        reader_construction_stage: GET_STAGE_READER_TASK_READER_CONSTRUCTION,
+        file_open_stage: GET_STAGE_READER_TASK_FILE_OPEN,
+        bitrot_reader_init_stage: GET_STAGE_READER_TASK_BITROT_READER_INIT,
+    });
+    let read_timeout = crate::disk::disk_store::get_object_disk_read_timeout();
+    let hedge_delay = crate::erasure::coding::decode::shard_read_hedge_delay(read_timeout);
+
+    let wave = async {
+        let setup_started = Instant::now();
+        let open_results = futures::future::join_all(plans.iter().map(|&(shard_idx, shard_read_offset, q_len, _, _)| {
+            let inline_data = files[shard_idx].data.clone();
+            let data_dir = files[shard_idx].data_dir.unwrap_or_default();
+            let disk = disks[shard_idx].as_ref();
+            let path = format!("{object}/{data_dir}/part.{part_number}");
+            let checksum_algo = checksum_algo.clone();
+            async move {
+                crate::io_support::bitrot::create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics(
+                    inline_data,
+                    disk,
+                    bucket,
+                    &path,
+                    shard_read_offset,
+                    q_len,
+                    logical_shard_size,
+                    frame_size,
+                    checksum_algo,
+                    false,
+                    use_mmap_read,
+                    stage_metrics,
+                )
+                .await
+            }
+        }))
+        .await;
+        let setup_elapsed = setup_started.elapsed();
+
+        let mut readers = Vec::with_capacity(plans.len());
+        let mut observed_corruption = false;
+        for result in open_results {
+            match result {
+                Ok(Some(reader)) => readers.push(reader),
+                Ok(None) => {
+                    return DirectSpannedQuantizedOutcome::Fallback {
+                        observed_corruption,
+                        timed_out: false,
+                    };
+                }
+                Err(err) => {
+                    if matches!(err, DiskError::FileCorrupt) {
+                        observed_corruption = true;
+                    }
+                    return DirectSpannedQuantizedOutcome::Fallback {
+                        observed_corruption,
+                        timed_out: false,
+                    };
+                }
+            }
+        }
+
+        let read_results = futures::future::join_all(readers.into_iter().zip(plans.iter()).map(
+            |(mut reader, &(_, _, q_len, rel_offset, slice_len))| async move {
+                let mut buf = Vec::with_capacity(q_len);
+                match reader.read_appending(&mut buf, q_len).await {
+                    Ok(read_bytes) if read_bytes == q_len => {
+                        Ok((buf, rel_offset, slice_len, reader.last_frame_count(), reader.last_read_dispatch_count()))
+                    }
+                    Ok(_) => Err(false),
+                    Err(err) => {
+                        let corrupt = matches!(err.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof)
+                            || matches!(DiskError::from(err), DiskError::FileCorrupt);
+                        Err(corrupt)
+                    }
+                }
+            },
+        ))
+        .await;
+
+        let mut slices = Vec::with_capacity(plans.len());
+        let mut total_frames = 0usize;
+        let mut total_dispatches = 0usize;
+        for result in read_results {
+            match result {
+                Ok((buf, rel_offset, slice_len, frames, dispatches)) => {
+                    total_frames = total_frames.saturating_add(frames);
+                    total_dispatches = total_dispatches.saturating_add(dispatches);
+                    slices.push((buf, rel_offset, slice_len));
+                }
+                Err(corrupt) => {
+                    observed_corruption |= corrupt;
+                    if observed_corruption {
+                        return DirectSpannedQuantizedOutcome::Fallback {
+                            observed_corruption: true,
+                            timed_out: false,
+                        };
+                    }
+                }
+            }
+        }
+        if slices.len() != plans.len() {
+            return DirectSpannedQuantizedOutcome::Fallback {
+                observed_corruption,
+                timed_out: false,
+            };
+        }
+
+        DirectSpannedQuantizedOutcome::Success(DirectSpannedQuantizedRead {
+            slices,
+            setup_elapsed,
+            window_bytes,
+            frame_count: total_frames,
+            read_dispatch_count: total_dispatches,
+        })
+    };
+
+    Ok(if let Some(delay) = hedge_delay {
+        match tokio::time::timeout(delay, wave).await {
+            Ok(outcome) => outcome,
+            Err(_) => DirectSpannedQuantizedOutcome::Fallback {
+                observed_corruption: false,
+                timed_out: true,
+            },
+        }
+    } else {
+        wave.await
+    })
 }
 
 fn multipart_reader_setup_prefetch_enabled(policy: GetObjectReadPolicy) -> bool {
@@ -6667,6 +6984,160 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quantized_range_wide_stripe_reads_only_spanned_shards_and_recovers_corruption() {
+        const BLOCK_SIZE: usize = 64 * 1024;
+        const FRAME_SIZE: usize = 4 * 1024;
+        let payload: Vec<u8> = (0..BLOCK_SIZE)
+            .map(|index| u8::try_from((index * 7 + 3) % 251).expect("fixture byte fits u8"))
+            .collect();
+        let erasure = coding::Erasure::new(8, 8, BLOCK_SIZE);
+        let mut encoded = vec![Vec::new(); erasure.total_shard_count()];
+        for (index, shard) in erasure
+            .encode_data(&payload)
+            .expect("fixture 8+8 block encodes")
+            .into_iter()
+            .enumerate()
+        {
+            let mut writer = BitrotWriter::new(Vec::new(), FRAME_SIZE, HashAlgorithm::HighwayHash256S);
+            for frame in shard.chunks(FRAME_SIZE) {
+                writer.write(frame).await.expect("fixture frame writes");
+            }
+            encoded[index].extend(writer.into_inner());
+        }
+
+        let mut fi = FileInfo::new(CODEC_STREAMING_TEST_OBJECT, 8, 8);
+        fi.volume = CODEC_STREAMING_TEST_BUCKET.to_string();
+        fi.name = CODEC_STREAMING_TEST_OBJECT.to_string();
+        fi.size = i64::try_from(payload.len()).expect("fixture size fits i64");
+        fi.is_latest = true;
+        fi.version_id = Some(Uuid::nil());
+        fi.data_dir = Some(Uuid::nil());
+        fi.mod_time = Some(time::OffsetDateTime::UNIX_EPOCH);
+        fi.metadata.insert("etag".to_string(), "fixture-etag".to_string());
+        fi.erasure.block_size = BLOCK_SIZE;
+        fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+        crate::object_api::insert_ec_read_quantum(&mut fi.metadata, FRAME_SIZE);
+        fi.add_object_part(1, "fixture-etag".to_string(), payload.len(), fi.mod_time, fi.size, None, None);
+
+        let files: Vec<FileInfo> = encoded
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                let mut file = fi.clone();
+                file.erasure.index = index + 1;
+                file.data = Some(Bytes::copy_from_slice(bytes));
+                file
+            })
+            .collect();
+        let (_dirs, disks) = local_test_disks(erasure.total_shard_count(), CODEC_STREAMING_TEST_BUCKET).await;
+
+        // 1. Single-shard 4 KiB Range GET at shard 5 (offset 40 KiB) must open ONLY shard 5, not all 8 data shards.
+        let single_calls = crate::set_disk::disk_call_counters::observe(CODEC_STREAMING_TEST_OBJECT);
+        let mut single_out = Vec::new();
+        SetDisks::read_quantized_range(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            &mut single_out,
+            &fi,
+            &files,
+            &disks,
+            &erasure,
+            FRAME_SIZE,
+            4 * 1024,
+            0,
+            0,
+            40 * 1024,
+            false,
+            true,
+            true,
+            false,
+            0,
+            0,
+            GET_OBJECT_PATH_SET_DISK,
+            "plain",
+            "small",
+        )
+        .await
+        .expect("single-shard 8+8 quantized range must succeed");
+        assert_eq!(single_out, payload[40 * 1024..44 * 1024]);
+        assert_eq!(
+            single_calls.total(crate::set_disk::disk_call_counters::KIND_INLINE_SHARD_OPEN),
+            1,
+            "healthy single-shard range on 8+8 must open only the target shard"
+        );
+        drop(single_calls);
+
+        // 2. Cross-shard 16 KiB Range GET starting at offset 22 KiB (shards 2..=4) must open ONLY the 3 spanned shards.
+        let spanned_calls = crate::set_disk::disk_call_counters::observe(CODEC_STREAMING_TEST_OBJECT);
+        let mut spanned_out = Vec::new();
+        SetDisks::read_quantized_range(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            &mut spanned_out,
+            &fi,
+            &files,
+            &disks,
+            &erasure,
+            FRAME_SIZE,
+            16 * 1024,
+            0,
+            0,
+            22 * 1024,
+            false,
+            true,
+            true,
+            false,
+            0,
+            0,
+            GET_OBJECT_PATH_SET_DISK,
+            "plain",
+            "small",
+        )
+        .await
+        .expect("spanned-shard 8+8 quantized range must succeed");
+        assert_eq!(spanned_out, payload[22 * 1024..38 * 1024]);
+        assert_eq!(
+            spanned_calls.total(crate::set_disk::disk_call_counters::KIND_INLINE_SHARD_OPEN),
+            3,
+            "healthy cross-shard 16 KiB range on 8+8 must open only shards 2..=4 in one parallel wave"
+        );
+
+        // 3. Corrupting shard 3 must emit zero unverified bytes and recover cleanly via coalesced parity reconstruction.
+        let mut corrupt_files = files.clone();
+        let mut bad_shard = corrupt_files[3].data.take().expect("shard 3 fixture").to_vec();
+        *bad_shard.last_mut().expect("shard 3 byte") ^= 0x5a;
+        corrupt_files[3].data = Some(Bytes::from(bad_shard));
+        let mut recovered_out = Vec::new();
+        SetDisks::read_quantized_range(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            &mut recovered_out,
+            &fi,
+            &corrupt_files,
+            &disks,
+            &erasure,
+            FRAME_SIZE,
+            16 * 1024,
+            0,
+            0,
+            22 * 1024,
+            false,
+            true,
+            true,
+            false,
+            0,
+            0,
+            GET_OBJECT_PATH_SET_DISK,
+            "plain",
+            "small",
+        )
+        .await
+        .expect("corrupted spanned shard must recover via coalesced parity decode");
+        assert_eq!(recovered_out, payload[22 * 1024..38 * 1024]);
     }
 
     #[test]

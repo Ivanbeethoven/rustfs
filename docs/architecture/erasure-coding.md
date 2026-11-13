@@ -148,15 +148,26 @@ healing operation. Multipart uploads select the value once at creation;
 
 Metadata quorum identity includes the decode geometry, including block size,
 while the legacy compatibility hash remains available for callers that need
-it. No performance target is implied without measurements on the target
-workload.
+it. When clients or SDKs map known object sizes onto hints automatically, use
+`64 KiB` up to `64 KiB`, `256 KiB` up to `256 KiB`, `1 MiB` for `(256 KiB, 16 MiB)`,
+and reserve `4 MiB` for objects `>= 16 MiB`
+(`recommend_ec_block_size_for_object_size`): `4 MiB–8 MiB` objects otherwise
+collapse to one or two stripes and pay higher first-stripe time-to-first-byte
+before multi-stripe pipelining can amortize it.
 
 #### 4.1.2 Bounded bitrot read quantum (RustFS V1)
 
 New, eligible EC writes may split each shard into smaller authenticated bitrot
 frames to reduce the amount of shard data read for small ranges. The selected
 frame size is recorded in the internal `ec-read-quantum` metadata pair; an
-absent marker means the historical one-frame-per-shard layout. Enable writes
+absent marker means the historical one-frame-per-shard layout. Because every
+non-final stripe must contain an exact integer number of equal-sized frames,
+`select_ec_read_quantum` activates only when `quantum` divides `shard_size` and
+`quantum * data_shards` divides `block_size` (for power-of-two candidate
+layouts, power-of-two `data_shards` such as `2`, `4`, or `8`); non-power-of-two
+geometries such as `12+4` intentionally keep `ec-read-quantum = None`
+(one frame per shard, e.g. `5,462 B` per shard on a `64 KiB` block) rather than
+introducing variable-length intra-stripe tail frames. Enable writes
 only after every reader and writer in the fleet understands this marker and
 frame format, using both `RUSTFS_EC_READ_QUANTUM_ENABLE=true` and
 `RUSTFS_EC_READ_QUANTUM_FLEET_CONFIRMED=true`. Both flags default to `false`.
