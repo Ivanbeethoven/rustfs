@@ -232,6 +232,26 @@ pub fn is_supported_ec_block_size(value: usize) -> bool {
     EC_BLOCK_SIZE_CANDIDATES.contains(&value)
 }
 
+/// Minimum known object size at which a `4 MiB` EC block hint outperforms
+/// `1 MiB`. Objects in `[1 MiB, 16 MiB)` span too few `4 MiB` stripes on wide
+/// geometries (such as `12+4` where `ec-read-quantum` stays one-frame-per-shard)
+/// to amortize the first-stripe time-to-first-byte latency, so keeping `1 MiB`
+/// blocks below `16 MiB` preserves multi-stripe pipelining.
+pub const MIN_OBJECT_SIZE_FOR_4MIB_EC_BLOCK: u64 = 16 * 1024 * 1024;
+
+/// Recommend a supported EC block-size hint for a known object length.
+pub const fn recommend_ec_block_size_for_object_size(object_size: u64) -> usize {
+    if object_size <= 64 * 1024 {
+        64 * 1024
+    } else if object_size <= 256 * 1024 {
+        256 * 1024
+    } else if object_size < MIN_OBJECT_SIZE_FOR_4MIB_EC_BLOCK {
+        1024 * 1024
+    } else {
+        4 * 1024 * 1024
+    }
+}
+
 /// Return whether the storage writer rollout is enabled and fleet-confirmed.
 /// Read it on the write path so each new object uses the active process
 /// environment values.
@@ -410,6 +430,26 @@ mod tests {
         assert_eq!(select_ec_read_quantum(256 * 1024, 2, 128 * 1024), Some(64 * 1024));
         assert_eq!(select_ec_read_quantum(1024 * 1024, 2, 512 * 1024), Some(256 * 1024));
         assert_eq!(select_ec_read_quantum(4 * 1024 * 1024, 2, 2 * 1024 * 1024), Some(1024 * 1024));
+        // Power-of-two wide sets (e.g. 8+8) align cleanly to 4 KiB frames on 64 KiB blocks,
+        // while non-power-of-two data_shards (e.g. 12+4) stay one-frame-per-shard (None).
+        assert_eq!(select_ec_read_quantum(64 * 1024, 8, 8 * 1024), Some(4 * 1024));
+        for block_size in EC_BLOCK_SIZE_CANDIDATES {
+            let shard_12 = block_size.div_ceil(12);
+            assert_eq!(select_ec_read_quantum(block_size, 12, shard_12), None);
+        }
+    }
+
+    #[test]
+    fn recommended_block_size_reserves_4mib_for_multi_stripe_objects() {
+        assert_eq!(recommend_ec_block_size_for_object_size(4 * 1024), 64 * 1024);
+        assert_eq!(recommend_ec_block_size_for_object_size(64 * 1024), 64 * 1024);
+        assert_eq!(recommend_ec_block_size_for_object_size(128 * 1024), 262_144);
+        assert_eq!(recommend_ec_block_size_for_object_size(256 * 1024), 262_144);
+        assert_eq!(recommend_ec_block_size_for_object_size(1024 * 1024), 1024 * 1024);
+        assert_eq!(recommend_ec_block_size_for_object_size(4 * 1024 * 1024), 1024 * 1024);
+        assert_eq!(recommend_ec_block_size_for_object_size(8 * 1024 * 1024), 1024 * 1024);
+        assert_eq!(recommend_ec_block_size_for_object_size(16 * 1024 * 1024), 4 * 1024 * 1024);
+        assert_eq!(recommend_ec_block_size_for_object_size(64 * 1024 * 1024), 4 * 1024 * 1024);
     }
 
     #[test]
